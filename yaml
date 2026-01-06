@@ -1,0 +1,61 @@
+
+---
+
+## Graph Representation
+
+Each user-month is represented as a directed graph with a fixed topology:
+
+**Nodes**
+- Income, User, Savings, Goal
+- Rent, Food, Transport, Utilities, Debt, Discretionary
+
+**Edges**
+- Income → User
+- User → Expense categories
+- User → Savings
+- Savings → Goal (normalized progress)
+
+Graph evolution is captured by changes in edge weights across months.
+
+---
+
+## Feature Engineering
+
+For each edge, the following temporal features are extracted over an observation window (months 1–6):
+
+- **Mean**: persistent financial pressure
+- **Standard deviation**: volatility / instability
+- **Trend**: direction of change over time
+
+These features are interpretable, compact, and suitable for explainable modeling.
+
+---
+
+## Prediction and Explanation
+
+An explainable baseline model (logistic regression) is trained to predict whether a user will reach their savings goal by month 12.
+
+Predictions are explained by:
+- identifying the most influential evolving edges
+- showing how changes in specific relationships affect outcomes
+- enabling counterfactual “what-if” analysis
+
+---
+
+## Interactive Demo
+
+The Streamlit demo allows users to:
+- select a user profile
+- view financial graph snapshots (months 1 / 6 / 12)
+- see predicted goal success probability
+- inspect top explanation drivers
+- simulate interventions (e.g., reducing rent or debt)
+- receive habit-oriented suggestions and challenges
+
+---
+
+## How to Run
+
+### 1. Install dependencies
+```bash
+pip install -r requirements.txt
