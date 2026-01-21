@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large generated artifacts
+graphs/
+*.joblib
+
+# Streamlit
+.streamlit/
+
+# Editor
+.vscode/

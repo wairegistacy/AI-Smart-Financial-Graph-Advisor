@@ -17,18 +17,103 @@ labels = pd.read_csv(os.path.join(DATA_DIR, "labels_goal12.csv"))
 model = joblib.load(os.path.join(DATA_DIR, "model.joblib"))
 feature_cols = joblib.load(os.path.join(DATA_DIR, "feature_cols.joblib"))
 
-# -------------------------
+# ---------- P2P (Mobile Money) Layer Helpers ----------
+
+# def pick_peer_ids(users_df, user_id: int, k: int = 3):
+#     """
+#     Deterministically pick k peer user_ids for each user_id,
+#     so the same peers are used across all months.
+#     """
+#     all_ids = users_df["user_id"].tolist()
+#     all_ids = [i for i in all_ids if int(i) != int(user_id)]
+#     rng = np.random.RandomState(int(user_id))  # deterministic
+#     peers = rng.choice(all_ids, size=k, replace=False)
+#     return [int(p) for p in peers]
+
+def apply_p2p_to_cashflow(row, total_out: float, total_in: float):
+    """
+    Optionally make P2P transfers affect the user’s cashflow:
+      - incoming transfers increase effective income
+      - outgoing transfers increase effective expenses (or reduce discretionary)
+    Returns adjusted income, adjusted expenses, adjusted savings.
+    """
+    income = float(row["income_eur"])
+    expenses = float(row["total_expenses_eur"])
+
+    income_adj = income + total_in
+    expenses_adj = expenses + total_out
+
+    savings_adj = max(0.0, income_adj - expenses_adj)
+    return income_adj, expenses_adj, savings_adj
+
+def simulate_p2p_for_month(users_df, monthly_df, user_id: int, month: int, k: int = 3):
+    """
+    Simulate P2P transfers for one user-month.
+    Returns:
+      peer_amounts_out: dict {Peer1..PeerK: amount_sent}
+      peer_amounts_in:  dict {Peer1..PeerK: amount_received}
+      total_out, total_in
+    Notes:
+      - Deterministic (repeatable) using seeded RNG.
+      - Makes transfers more dramatic during shock months.
+    """
+    # Base row
+    row = monthly_df[(monthly_df["user_id"] == user_id) & (monthly_df["month"] == month)].iloc[0]
+    income = float(row["income_eur"])
+    discretionary = float(row.get("discretionary_eur", 0.0))
+
+    # User shock info (if present)
+    u = users_df.loc[users_df["user_id"] == user_id].iloc[0]
+    shock_type = str(u.get("shock_type", "none")).lower()
+    shock_start = int(u.get("shock_start_month", 99)) if not np.isnan(u.get("shock_start_month", 99)) else 99
+
+    shock_active = (month >= shock_start) and (shock_type != "none")
+
+    # Deterministic RNG per (user, month)
+    rng = np.random.RandomState(int(user_id) * 1000 + int(month))
+
+    # How much total out/in? (simple but plausible)
+    # Outgoing: small fraction of income, capped by discretionary
+    out_frac = rng.uniform(0.00, 0.05)  # 0–5% of income
+    total_out = min(discretionary * rng.uniform(0.2, 0.8), income * out_frac)
+
+    # Incoming: usually smaller; increases if shock_active (support network)
+    in_base = rng.uniform(0.00, 0.03) * income
+    if shock_active:
+        # “Friends/family help” effect during shock
+        in_base *= rng.uniform(1.5, 3.0)
+    total_in = in_base
+
+    # Split totals across K peers (Dirichlet proportions)
+    k = int(k)
+    out_parts = rng.dirichlet(alpha=np.ones(k)) * total_out
+    in_parts = rng.dirichlet(alpha=np.ones(k)) * total_in
+
+    peer_amounts_out = {f"Peer{i+1}": float(out_parts[i]) for i in range(k)}
+    peer_amounts_in  = {f"Peer{i+1}": float(in_parts[i])  for i in range(k)}
+
+    return peer_amounts_out, peer_amounts_in, float(total_out), float(total_in)
+
 # Graph + feature functions (same as training)
 # -------------------------
-def build_financial_graph(users_df, monthly_df, user_id, month):
+def build_financial_graph(users_df, monthly_df, user_id, month, k_peers=3, include_p2p=True, p2p_affects_cashflow=True, include_bank= True):
     row = monthly_df[(monthly_df["user_id"] == user_id) & (monthly_df["month"] == month)].iloc[0]
 
     G = nx.DiGraph()
-    nodes = ["User","Income","Savings","Goal","Rent","Food","Transport","Utilities","Debt","Discretionary"]
-    G.add_nodes_from(nodes)
 
-    G.add_edge("Income", "User", weight=float(row["income_eur"]))
+    # Base nodes
+    base_nodes = ["User","Income","Savings","Goal","Rent","Food","Transport","Utilities","Debt","Discretionary"]
+    G.add_nodes_from(base_nodes)
 
+    if include_bank:
+        G.add_node("Bank")
+
+    # Peer nodes (fixed labels keep feature columns consistent across users)
+    peer_nodes = [f"Peer{i}" for i in range(1, int(k_peers) + 1)]
+    if include_p2p:
+        G.add_nodes_from(peer_nodes)
+
+    # Expense edges
     expense_map = {
         "Rent": "rent_eur",
         "Food": "food_eur",
@@ -40,11 +125,58 @@ def build_financial_graph(users_df, monthly_df, user_id, month):
     for node, col in expense_map.items():
         G.add_edge("User", node, weight=float(row[col]))
 
-    G.add_edge("User", "Savings", weight=float(row["savings_eur"]))
+    # Start with dataset income/savings
+    income_w = float(row["income_eur"])
+    savings_w = float(row["savings_eur"])
+    total_in = 0.0
+    total_out = 0.0
 
+    # ---- P2P layer (Mobile Money abstraction) ----
+    if include_p2p:
+        peer_out, peer_in, total_out, total_in = simulate_p2p_for_month(
+            users_df, monthly_df, int(user_id), int(month), k=int(k_peers)
+        )
+
+        # Outgoing: User -> PeerX
+        for peer, amt in peer_out.items():
+            G.add_edge("User", peer, weight=float(amt))
+
+        # Incoming: PeerX -> User
+        for peer, amt in peer_in.items():
+            G.add_edge(peer, "User", weight=float(amt))
+
+        # Optionally let P2P affect income/expenses/savings
+        if p2p_affects_cashflow:
+            income_adj, expenses_adj, savings_adj = apply_p2p_to_cashflow(row, total_out, total_in)
+            income_w = float(income_adj)
+            savings_w = float(savings_adj)
+
+    # --- Banking abstraction ---
+    if include_bank:
+        # Income arrives to bank account
+        G.add_edge("Income", "Bank", weight=float(income_w))
+        # Bank makes funds available to user
+        G.add_edge("Bank", "User", weight=float(income_w))
+
+        # Aggregate outgoing payments leaving the account
+        # (category edges remain for explanation)
+        total_exp = float(row["total_expenses_eur"]) + float(total_out)  # include p2p out as money leaving user
+        G.add_edge("User", "Bank", weight=float(total_exp))
+    else:
+        # Original simpler model
+        G.add_edge("Income", "User", weight=float(income_w))
+
+    # Savings edge (possibly adjusted)
+    G.add_edge("User", "Savings", weight=float(savings_w))
+
+    # Optional: savings stored in bank
+    if include_bank:
+        G.add_edge("Savings", "Bank", weight=float(savings_w))
+
+    # Goal progress edge (kept as-is for MVP)
     goal = float(users_df.loc[users_df["user_id"] == user_id, "goal_amount_eur"].iloc[0])
     progress = float(row["cumulative_savings_eur"]) / goal if goal > 0 else 0.0
-    G.add_edge("Savings", "Goal", weight=progress)
+    G.add_edge("Savings", "Goal", weight=float(progress))
 
     return G
 
@@ -271,19 +403,38 @@ feats = extract_graph_features(edge_ts)
 
 # Apply counterfactual on FEATURES (simple + consistent with this baseline)
 # Since features are edge-based, we can adjust the relevant edge means/trends.
-def apply_counterfactual(feats, rent_reduce, debt_reduce):
+def apply_counterfactual(feats, rent_reduce, debt_reduce, disc_reduce):
     feats = dict(feats)  # copy
-    if rent_reduce > 0:
+
+    def scale_prefix(prefix, pct):
+        if pct <= 0:
+            return
         for k in list(feats.keys()):
-            if k.startswith("User->Rent_"):
-                feats[k] *= (1 - rent_reduce/100)
-    if debt_reduce > 0:
+            if k.startswith(prefix):
+                feats[k] *= (1 - pct / 100.0)
+
+    scale_prefix("User->Rent_", rent_reduce)
+    scale_prefix("User->Debt_", debt_reduce)
+    scale_prefix("User->Discretionary_", disc_reduce)
+
+    # If reducing expenses, total outgoing to bank should also reduce
+    if (rent_reduce + debt_reduce + disc_reduce) > 0:
         for k in list(feats.keys()):
-            if k.startswith("User->Debt_"):
-                feats[k] *= (1 - debt_reduce/100)
+            if k.startswith("User->Bank_"):
+                # rough: scale by average of reductions (simple MVP approximation)
+                avg = (rent_reduce + debt_reduce + disc_reduce) / 3.0
+                feats[k] *= (1 - avg/100.0)
+
+    
+    # Optional: discretionary cut also reduces outgoing P2P (User->PeerX)
+    if disc_reduce > 0:
+        for k in list(feats.keys()):
+            if k.startswith("User->Peer") and ("_mean" in k or "_trend" in k or "_std" in k):
+                feats[k] *= (1 - disc_reduce / 100.0)
+
     return feats
 
-feats_cf = apply_counterfactual(feats, rent_reduce, debt_reduce)
+feats_cf = apply_counterfactual(feats, rent_reduce, debt_reduce, disc_reduce)
 
 X_row = align_features(feats_cf, feature_cols)
 

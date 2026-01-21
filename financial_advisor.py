@@ -174,6 +174,84 @@ def build_financial_graph(users_df, monthly_df, user_id, month):
 
     return G
 
+# ---------- P2P (Mobile Money) Layer Helpers ----------
+def pick_peer_ids(users_df, user_id: int, k: int = 3):
+    """
+    Deterministically pick k peer user_ids for each user_id,
+    so the same peers are used across all months.
+    """
+    all_ids = users_df["user_id"].tolist()
+    all_ids = [i for i in all_ids if int(i) != int(user_id)]
+    rng = np.random.RandomState(int(user_id))  # deterministic
+    peers = rng.choice(all_ids, size=k, replace=False)
+    return [int(p) for p in peers]
+
+def simulate_p2p_for_month(users_df, monthly_df, user_id: int, month: int, k: int = 3):
+    """
+    Simulate P2P transfers for one user-month.
+    Returns:
+      peer_amounts_out: dict {Peer1..PeerK: amount_sent}
+      peer_amounts_in:  dict {Peer1..PeerK: amount_received}
+      total_out, total_in
+    Notes:
+      - Deterministic (repeatable) using seeded RNG.
+      - Makes transfers more dramatic during shock months.
+    """
+    # Base row
+    row = monthly_df[(monthly_df["user_id"] == user_id) & (monthly_df["month"] == month)].iloc[0]
+    income = float(row["income_eur"])
+    discretionary = float(row.get("discretionary_eur", 0.0))
+
+    # User shock info (if present)
+    u = users_df.loc[users_df["user_id"] == user_id].iloc[0]
+    shock_type = str(u.get("shock_type", "none")).lower()
+    shock_start = int(u.get("shock_start_month", 99)) if not np.isnan(u.get("shock_start_month", 99)) else 99
+
+    shock_active = (month >= shock_start) and (shock_type != "none")
+
+    # Deterministic RNG per (user, month)
+    rng = np.random.RandomState(int(user_id) * 1000 + int(month))
+
+    # How much total out/in? (simple but plausible)
+    # Outgoing: small fraction of income, capped by discretionary
+    out_frac = rng.uniform(0.00, 0.05)  # 0–5% of income
+    total_out = min(discretionary * rng.uniform(0.2, 0.8), income * out_frac)
+
+    # Incoming: usually smaller; increases if shock_active (support network)
+    in_base = rng.uniform(0.00, 0.03) * income
+    if shock_active:
+        # “Friends/family help” effect during shock
+        in_base *= rng.uniform(1.5, 3.0)
+    total_in = in_base
+
+    # Split totals across K peers (Dirichlet proportions)
+    k = int(k)
+    out_parts = rng.dirichlet(alpha=np.ones(k)) * total_out
+    in_parts = rng.dirichlet(alpha=np.ones(k)) * total_in
+
+    peer_amounts_out = {f"Peer{i+1}": float(out_parts[i]) for i in range(k)}
+    peer_amounts_in  = {f"Peer{i+1}": float(in_parts[i])  for i in range(k)}
+
+    return peer_amounts_out, peer_amounts_in, float(total_out), float(total_in)
+
+def apply_p2p_to_cashflow(row, total_out: float, total_in: float):
+    """
+    Optionally make P2P transfers affect the user’s cashflow:
+      - incoming transfers increase effective income
+      - outgoing transfers increase effective expenses (or reduce discretionary)
+    Returns adjusted income, adjusted expenses, adjusted savings.
+    """
+    income = float(row["income_eur"])
+    expenses = float(row["total_expenses_eur"])
+
+    income_adj = income + total_in
+    expenses_adj = expenses + total_out
+
+    savings_adj = max(0.0, income_adj - expenses_adj)
+    return income_adj, expenses_adj, savings_adj
+# ------------------------------------------------------
+
+
 # Draw a graph snapshot
 def draw_graph(G: nx.DiGraph, title: str):
     plt.figure(figsize=(12, 7))
